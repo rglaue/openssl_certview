@@ -1,0 +1,406 @@
+#!/bin/bash
+
+PROGNAME="certview"
+VERSION="1.11-20210916"
+BIN_OPENSSL="openssl"
+CABUNDLE_FILE=""
+VERBOSE=0
+DEBUG=0
+NOOUT=""
+TEXT=""
+
+function echo_v () {
+  if [[ $VERBOSE -ge 1 ]]; then
+    echo "$@"
+  fi
+}
+
+function echo_w () {
+  if [[ $VERBOSE -ge 1 ]]; then
+    cat <<< "$@" 1>&2;
+  fi
+}
+
+# usage: echo_d <level> <message>
+# If <level> is >= $DEBUG <message> is sent to stderr
+function echo_d () {
+  if [[ $DEBUG -ge $1 ]]; then
+    shift 1
+    cat <<< "[DEBUG] $@" 1>&2;
+  fi
+}
+
+function echo_e () {
+  cat <<< "$@" 1>&2;
+}
+
+function view_pem_file () {
+  type="${1:-"rsa"}"  # rsa, x509, req
+  pem_file="$2"
+  echo_d 1 "view_pem_file type=$type pem_file=$pem_file"
+
+  crt_num=1
+  while true; do
+    # type examples: x509="BEGIN CERTIFICATE" rsa="BEGIN PRIVATE KEY"
+    crt_content=$(awk -v n=${crt_num} '/^-----BEGIN CERTIFICATE-----/ && ++k == n, /^-----END CERTIFICATE-----/' $pem_file)
+    [ -z "$crt_content" ] && break
+    echo "$crt_content" | ${BIN_OPENSSL} ${type} ${TEXT} ${NOOUT}
+    let "crt_num+=1"
+  done
+}
+
+function view_pkcs12_file () {
+  pkcs12_file="$1"
+  echo_d 1 "view_pkcs12_file pkcs12_file=$pkcs12_file"
+  crt_num=1
+  # Conversion performed because pkcs12 does not support "-text" option
+  all_crt_content=$(${BIN_OPENSSL} pkcs12 -nokeys -in $pkcs12_file)
+  while true; do
+    crt_content=$(echo "$all_crt_content" | awk -v n=${crt_num} '/^-----BEGIN CERTIFICATE-----/ && ++k == n, /^-----END CERTIFICATE-----/')
+    [ -z "$crt_content" ] && break
+    echo "$crt_content" | ${BIN_OPENSSL} x509 ${TEXT} ${NOOUT}
+    let "crt_num+=1"
+  done
+}
+
+function get_ssl_server_crt () {
+  crt_server="$1"
+  if [[ ! $crt_server =~ \:[0-9]+$ ]]; then
+    # If a port was not given, we will assume port 443
+    crt_server="${crt_server}:443"
+  fi
+  echo "" | ${BIN_OPENSSL} s_client -connect "${crt_server}"
+}
+
+function view_ssl_server () {
+  crt_server="$1"
+  echo_d 1 "view_ssl_server crt_server=${crt_server}"
+  get_ssl_server_crt $crt_server | ${BIN_OPENSSL} x509 -text ${TEXT} ${NOOUT}
+}
+
+function get_openssl_modulus () {
+  pem_file="$1"   # can be: crt,  key, or csr
+  type="$2"       # can be: x509, rsa, or req
+  [ -z "$type" ] && type="rsa"
+  ${BIN_OPENSSL} ${type} -in "${pem_file}" -noout -modulus|${BIN_OPENSSL} md5
+}
+
+# Get the number of days until expiration
+# If the crt is expired, days will be a negative number of days since expiration
+function get_openssl_crt_file_expiration_days () {
+  crt_file="$1"
+  DAYS=$(( ( $(date -d "$(${BIN_OPENSSL} x509 -enddate -in "$crt_file" -noout | cut -f2 -d=)" +%s) - $(date +%s) ) /86400 ))
+  echo ${DAYS}
+}
+function get_openssl_crt_content_expiration_days () {
+  crt_content="$1"
+  DAYS=$(( ( $(date -d "$(${BIN_OPENSSL} x509 -enddate -noout <<<"$crt_content" | cut -f2 -d=)" +%s) - $(date +%s) ) /86400 ))
+  echo ${DAYS}
+}
+
+function validate_crt_file () {
+  crt_source="$1"
+  warn_days="$2"  # fail if crt will expire within N days
+  type="x509"
+  crt_file=""
+  crt_serv=""
+  if [[ "$crt_source" =~ .*\:[\d]* ]]; then
+    crt_serv="$crt_source"
+  else
+    crt_file="$crt_source"
+  fi
+  if [[ ! $warn_days -ge 0 ]]; then
+    warn_days=0
+  fi
+  echo_d 1 "validate_crt_file crt_source=$crt_source"
+
+  RET=0
+  crt_num=1
+  [ ! -z "$crt_file" ] && crt_data=$(cat $crt_file)
+  [ ! -z "$crt_serv" ] && crt_data=$(get_ssl_server_crt $crt_serv 2>/dev/null)
+  CRT_COUNT=0
+  while true; do
+    echo_d 1 "validate_crt_file $type certificate_number=$crt_num"
+    crt_x509=$(echo "$crt_data" | awk -v n=${crt_num} '/^-----BEGIN CERTIFICATE-----/ && ++k == n, /^-----END CERTIFICATE-----/')
+    [ -z "$crt_x509" ] && break
+    commonName=$(${BIN_OPENSSL} $type -noout -subject <<<"$crt_x509" | awk -F= '{print $NF}' | sed -e 's/^[ \t]*//')
+    let "crt_num+=1"
+    DAYS=$( get_openssl_crt_content_expiration_days "$crt_x509" )
+    if [[ ${DAYS} -gt $warn_days ]]; then
+      echo_v "Certificate OK, ${DAYS} days until expiration: $commonName"
+      let CRT_COUNT++
+    elif [[ ${DAYS} -gt 0 ]]; then
+      echo_v "Certificate has ${DAYS} days until expiration: $commonName"
+      let CRT_COUNT++
+      RET=1
+    elif [[ ! -z "$DAYS" ]]; then
+      echo_v "Certificate expired by ${DAYS} days: $commonName"
+      let CRT_COUNT++
+      RET=1
+    else
+      echo_e "Could not determine expiration of Certificate: $commonName"
+      RET=1
+    fi
+  done
+  if [[ ! $CRT_COUNT -ge 1 ]]; then
+    echo_d 1 "validate_crt_file No certificates could be retrieved from source"
+    RET=1
+  fi
+  return $RET
+}
+
+function validate_crt_chain_files () {
+  crt_file="$1"
+  chain_file="$2"
+  echo_d 1 "validate_crt_chain_files crt_file=$crt_file chain_file=$chain_file ca=$CABUNDLE_FILE"
+  [ -z "${CABUNDLE_FILE}" ] && echo_w "Warning: CA file not defined"
+  OUTPUT=$( ${BIN_OPENSSL} verify -verbose -CAfile <(cat $chain_file $CABUNDLE_FILE) $crt_file 2>&1 );
+  RET="$?"
+  echo_v $OUTPUT
+  return $RET
+}
+
+function validate_key_crt_files () {
+  key_file="$1"
+  crt_file="$2"
+  echo_d 1 "validate_key_crt_files key_file=$key_file crt_file=$crt_file"
+  echo_v "key modulus checksum: $(get_openssl_modulus $key_file "rsa")"
+  echo_v "crt modulus checksum: $(get_openssl_modulus $crt_file "x509")"
+  if [ "$(get_openssl_modulus $key_file "rsa")" != "$(get_openssl_modulus $crt_file "x509")" ]; then
+    echo_d 1 "validate_key_crt_files The modulus of the key and crt do not match."
+    return 1;
+  fi
+  return 0;
+}
+
+function validate_key_crt_chain_files () {
+  key_file="$1"
+  crt_file="$2"
+  chain_file="$3"
+  echo_d 1 "validate_key_crt_chain_files key_file=$key_file crt_file=$crt_file chain_file=$chain_file ca=$CABUNDLE_FILE"
+  validate_crt_file "${crt_file}" && validate_key_crt_files "${key_file}" "${crt_file}" && validate_crt_chain_files "${crt_file}" "${chain_file}" 
+}
+
+
+USR_KEY_FILE=""
+USR_CRT_FILE=""
+USR_CHAIN_FILE=""
+USR_PKCS12_FILE=""
+USR_SSL_SERVER=""
+USR_REQ=""        # view|validate
+
+function help_msg () {
+  echo "  $PROGNAME, Version: $VERSION"
+cat <<"HELP_EOM"
+  Usage: $0 [-a|-v|-noout|-text] (view|validate) [ -ca <file>, -key <file>, -crt <file>, -chain <file>, -p12 <file>, -server <hostname[:port]> ]
+      OpenSSL Options
+        -a          use all options: -a -v -noout -text
+        -v          verbose
+        -noout      prevents output of the encoded version of the certificate
+        -text       prints out the certificate in text form
+        -debug      print debug messages
+      CertView Procedures
+        view        View a certificate
+        validate    Validate a certificate using: -ca -key -crt -chain -server
+            validate -crt = is crt in this file expired?
+            validate -server = is crt from this host:port expired?
+            validate -key -crt = does modulus checksum of key and crt match?
+            validate [-ca] -crt -chain = valid chain from -crt to a trusted CA?
+            validate [-ca] -key -crt -chain = check modulus and validate chain
+      CertView Arguments
+        -ca file    provide the certificate authority bundle file
+        -key file   provide the key of the certificate as a file
+        -crt file   provide the certificate file
+        -chain file provide the certificate authority chain file
+        -p12 file   provide the certificate in pkcs12 file format (view only)
+        -server h:p use this hostname and port to obtain the certificate
+HELP_EOM
+}
+
+if [ -z "$1" ]; then
+  help_msg
+  exit 0
+fi
+
+
+function view_on_args () {
+  if [ ! -z "${USR_CSR_FILE}" ]; then
+    view_pem_file "req" "${USR_CSR_FILE}"
+    return "$?"
+  fi
+  if [ ! -z "${USR_KEY_FILE}" ]; then
+    view_pem_file "rsa" "${USR_KEY_FILE}"
+    return "$?"
+  fi
+  if [ ! -z "${USR_CRT_FILE}" ]; then
+    view_pem_file "x509" "${USR_CRT_FILE}"
+    return "$?"
+  fi
+  if [ ! -z "${USR_CHAIN_FILE}" ]; then
+    view_pem_file "x509" "${USR_CHAIN_FILE}"
+    return "$?"
+  fi
+  if [ ! -z "${USR_PKCS12_FILE}" ]; then
+    view_pkcs12_file "${USR_PKCS12_FILE}"
+    return "$?"
+  fi
+  if [ ! -z "${USR_SSL_SERVER}" ]; then
+    view_ssl_server "${USR_SSL_SERVER}"
+    return "$?"
+  fi
+  help_msg
+  return 1
+}
+
+function validate_on_args () {
+  if [ ! -z "${USR_KEY_FILE}" ] && [ ! -z "${USR_CRT_FILE}" ] && [ ! -z "${USR_CHAIN_FILE}" ]; then
+    validate_key_crt_chain_files "${USR_KEY_FILE}" "${USR_CRT_FILE}" "${USR_CHAIN_FILE}"
+    RET="$?"
+    if [[ $RET -ge 1 ]]; then
+      echo_v "validation failed"
+    else
+      echo_v "success"
+    fi
+    return $RET
+  elif [ ! -z "${USR_KEY_FILE}" ] && [ ! -z "${USR_CRT_FILE}" ]; then
+    validate_key_crt_files "${USR_KEY_FILE}" "${USR_CRT_FILE}"
+    RET="$?"
+    if [[ $RET -ge 1 ]]; then
+      echo_v "validation failed"
+    else
+      echo_v "success"
+    fi
+    return $RET
+  elif [ ! -z "${USR_CRT_FILE}" ] && [ ! -z "${USR_CHAIN_FILE}" ]; then
+    validate_crt_chain_files "${USR_CRT_FILE}" "${USR_CHAIN_FILE}"
+    RET="$?"
+    if [[ $RET -ge 1 ]]; then
+      echo_v "validation failed"
+    else
+      echo_v "success"
+    fi
+    return $RET
+  elif [ ! -z "${USR_CRT_FILE}" ]; then
+    validate_crt_file "${USR_CRT_FILE}"
+    RET="$?"
+    if [[ $RET -ge 1 ]]; then
+      echo_v "validation failed"
+    else
+      echo_v "success"
+    fi
+    return $RET
+  elif [ ! -z "${USR_SSL_SERVER}" ]; then
+    validate_crt_file "${USR_SSL_SERVER}"
+    RET="$?"
+    if [[ $RET -ge 1 ]]; then
+      echo_v "validation failed"
+    else
+      echo_v "success"
+    fi
+    return $RET
+  elif [ ! -z "${USR_PKCS12_FILE}" ]; then
+      echo_e "Validating certificates in a pkcs12 file is not supported."
+      return 1
+  else
+    help_msg
+    return 1
+  fi
+}
+
+
+while [ ! -z "$1" ]; do
+  if   [[ "$1" = "-v" ]]; then
+    VERBOSE=1
+    shift
+  elif [[ "$1" = "-noout" ]]; then
+    NOOUT="-noout"
+    shift
+  elif [[ "$1" = "-text" ]]; then
+    TEXT="-text"
+    shift
+  elif [[ "$1" = "-a" ]]; then
+    VERBOSE=1
+    NOOUT="-noout"
+    TEXT="-text"
+    shift
+  elif [[ "$1" = "-debug" ]]; then
+    # Hidden option
+    DEBUG=1
+    shift
+  elif [[ "$1" = "validate" ]]; then
+    USR_REQ="validate"
+    shift
+  elif [[ "$1" = "view" ]]; then
+    USR_REQ="view"
+    shift
+  else
+    # validate [ ca <file>, key <file>, crt <file>, chain <file>, server <hostname[:port]> ]
+    if [ "$1" = "-ca" ]; then
+      if [ -f "$2" ]; then
+        CABUNDLE_FILE="$2"
+      else
+        echo_e "Error: CA file \"$2\" does not exist."
+      fi
+      shift 2
+    elif [ "$1" = "-key" ]; then
+      if [ -f "$2" ]; then
+        USR_KEY_FILE="$2"
+      else
+        echo_e "Error: key file \"$2\" does not exist."
+      fi
+      shift 2
+    elif [ "$1" = "-crt" ]; then
+      if [ -f "$2" ]; then
+        USR_CRT_FILE="$2"
+      else
+        echo_e "Error: crt file \"$2\" does not exist."
+      fi
+      shift 2
+    elif [ "$1" = "-chain" ]; then
+      if [ -f "$2" ]; then
+        USR_CHAIN_FILE="$2"
+      else
+        echo_e "Error: chain file \"$2\" does not exist."
+      fi
+      shift 2
+    elif [ "$1" = "-server" ]; then
+      USR_SSL_SERVER="$2"
+      shift 2
+    elif [ "$1" = "-p12" ]; then
+      USR_PKCS12_FILE="$2"
+      shift 2
+    else
+      echo_e "Error: Unknown argument \"$1\"."
+      shift
+    fi
+  fi
+done
+
+# Check for input
+if    [ ! -z "${USR_KEY_FILE}" ] \
+   || [ ! -z "${USR_CRT_FILE}" ] \
+   || [ ! -z "${USR_CHAIN_FILE}" ] \
+   || [ ! -z "${USR_PKCS12_FILE}" ] \
+   || [ ! -z "${USR_SSL_SERVER}" ]; then
+  # Some or all input was provided
+  true
+else
+  # No input was provided
+  echo_e "Input Error: One of key, crt, chain, or server must be provided."
+  help_msg
+  exit 1
+fi
+
+[ ! -z "${CABUNDLE_FILE}"  ]  && echo_v "       ca file: ${CABUNDLE_FILE}"
+[ ! -z "${USR_KEY_FILE}"   ]  && echo_v "      key file: ${USR_KEY_FILE}"
+[ ! -z "${USR_CRT_FILE}"   ]  && echo_v "      crt file: ${USR_CRT_FILE}"
+[ ! -z "${USR_CHAIN_FILE}" ]  && echo_v "    chain file: ${USR_CHAIN_FILE}"
+[ ! -z "${USR_PKCS12_FILE}" ] && echo_v "   pkcs12 file: ${USR_PKCS12_FILE}"
+[ ! -z "${USR_SSL_SERVER}" ]  && echo_v "    SSL server: ${USR_SSL_SERVER}"
+
+
+if   [[ ${USR_REQ} = "view" ]]; then
+  view_on_args
+elif [[ ${USR_REQ} = "validate" ]]; then
+  validate_on_args
+fi
